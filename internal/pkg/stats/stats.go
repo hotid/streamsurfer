@@ -1,16 +1,11 @@
-// The code keeps streams statistics and program internal statistics.
-// Statistics output to files and to JSON HTTP API.
-package main
+package stats
 
 import (
 	"errors"
+	"github.com/hotid/streamsurfer/internal/pkg/storage"
+	. "github.com/hotid/streamsurfer/internal/pkg/structures"
 	"sync"
 	"time"
-)
-
-var (
-	logq chan LogMessage
-	//statIn chan Stats
 )
 
 var StatsGlobals = struct {
@@ -55,9 +50,10 @@ type Incident struct {
 
 // Elder
 // Gather results history and statistics from all streamboxes
-func StatKeeper() {
+func StatKeeper(cfg *Config) {
 	//var results map[Key][]Result = make(map[Key][]Result)
 	var stats map[Key]Stats = make(map[Key]Stats)
+	lastCleanUpTime := time.Now()
 	//	var errors map[Key]map[time.Time]ErrType = make(map[Key]map[time.Time]ErrType)
 
 	statIn = make(chan StatInQuery, 8192) // receive stats
@@ -72,7 +68,7 @@ func StatKeeper() {
 	for {
 		select {
 		case state := <-statIn: // receive new statitics data for saving
-			stats[Key{state.Stream.Group, state.Stream.Name}] = state.Last
+			stats[state.Stream.StreamKey] = state.Last
 
 		case key := <-statOut:
 			if val, ok := stats[key.Key]; ok {
@@ -83,14 +79,14 @@ func StatKeeper() {
 
 		case state := <-resultIn: // incoming results from streamboxes
 			//results[Key{state.Stream.Group, state.Stream.Name}] = append(results[Key{state.Stream.Group, state.Stream.Name}], state.Last)
-			RedKeepResult(Key{state.Stream.Group, state.Stream.Name}, state.Last.Started, state.Last)
+			storage.RedKeepResult(state.Stream.StreamKey, state.Last.Started, state.Last)
 			if state.Last.ErrType > WARNING_LEVEL {
-				RedKeepError(Key{state.Stream.Group, state.Stream.Name}, state.Last.Started, state.Last.ErrType)
+				storage.RedKeepError(state.Stream.StreamKey, state.Last.Started, state.Last.ErrType)
 			}
 			//		delete(errors, Key{state.Stream.Group, state.Stream.Name})
 
 		case key := <-resultOut:
-			data, err := RedLoadResults(key.Key, time.Now().Add(-6*time.Hour), time.Now())
+			data, err := storage.RedLoadResults(key.Key, time.Now().Add(-6*time.Hour), time.Now())
 			if err != nil {
 				key.ReplyTo <- nil
 			} else {
@@ -100,7 +96,7 @@ func StatKeeper() {
 		case key := <-errorsOut: // get error list by streams
 			//			result := make(map[time.Time]ErrType)
 
-			data, err := RedLoadErrors(key.Key, key.From, key.To)
+			data, err := storage.RedLoadErrors(key.Key, key.From, key.To)
 			if err != nil {
 				key.ReplyTo <- nil
 			} else {
@@ -108,8 +104,11 @@ func StatKeeper() {
 			}
 
 		default: // expired keys cleanup
-			RemoveExpiredErrors(cfg.ExpireDurationDB)
-			RemoveExpiredResults(cfg.ExpireDurationDB)
+			if time.Since(lastCleanUpTime) > 30*time.Second {
+				storage.RemoveExpiredErrors(cfg.ExpireDurationDB, cfg)
+				storage.RemoveExpiredResults(cfg.ExpireDurationDB, cfg)
+				lastCleanUpTime = time.Now()
+			}
 		}
 	}
 }

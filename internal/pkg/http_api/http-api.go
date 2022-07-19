@@ -1,5 +1,5 @@
 // HTTP API to control probe service for representing collected data.
-package main
+package http_api
 
 import (
 	"crypto/sha1"
@@ -7,6 +7,11 @@ import (
 	"expvar"
 	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/hotid/streamsurfer/internal/pkg/helpers"
+	. "github.com/hotid/streamsurfer/internal/pkg/logging"
+	. "github.com/hotid/streamsurfer/internal/pkg/stats"
+	. "github.com/hotid/streamsurfer/internal/pkg/structures"
+	"github.com/hotid/streamsurfer/internal/pkg/zabbix"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,9 +21,11 @@ import (
 )
 
 var Page *template.Template
+var cfg *Config
 
 // Elder.
-func HttpAPI() {
+func HttpAPI(config *Config) {
+	cfg = config
 	var err error
 
 	Page, err = template.ParseGlob("templates/*.tmpl")
@@ -112,6 +119,10 @@ func monError(res http.ResponseWriter, req *http.Request, vars map[string]string
 	res.Header().Set("Content-Type", "text/plain")
 
 	if vars["group"] != "" && vars["stream"] != "" {
+		streamKey, err := KeyFromHex(vars["stream"])
+		if err != nil {
+			return
+		}
 		if !StatsGlobals.MonitoringState {
 			switch vars["astype"] { // пока мониторинг остановлен, считаем, что всё ок
 			case "str":
@@ -121,7 +132,7 @@ func monError(res http.ResponseWriter, req *http.Request, vars map[string]string
 			}
 			return
 		}
-		if result, err := LoadLastResult(Key{vars["group"], vars["stream"]}); err == nil {
+		if result, err := LoadLastResult(streamKey); err == nil {
 			switch vars["astype"] {
 			case "str":
 				res.Write([]byte(StreamErr2String(result.ErrType)))
@@ -149,16 +160,21 @@ func monErrorLevel(res http.ResponseWriter, req *http.Request, vars map[string]s
 	res.Header().Set("Content-Type", "text/plain")
 
 	if vars["group"] != "" && vars["stream"] != "" && vars["fromerrlevel"] != "" && vars["uptoerrlevel"] != "" {
+		streamKey, err := KeyFromHex(vars["stream"])
+		if err != nil {
+			return
+		}
 		if !StatsGlobals.MonitoringState {
 			res.Write([]byte("0")) // пока мониторинг остановлен, считаем, что всё ок
 			return
 		}
-		if result, err := LoadLastResult(Key{vars["group"], vars["stream"]}); err == nil {
+
+		if result, err := LoadLastResult(streamKey); err == nil {
 			cur := result.ErrType
 			switch {
-			case cur <= String2StreamErr(vars["fromerrlevel"]):
+			case cur <= helpers.String2StreamErr(vars["fromerrlevel"]):
 				res.Write([]byte("0")) // OK
-			case cur >= String2StreamErr(vars["uptoerrlevel"]):
+			case cur >= helpers.String2StreamErr(vars["uptoerrlevel"]):
 				res.Write([]byte("2")) // FATAL
 			default:
 				res.Write([]byte("1")) // PROBLEM
@@ -226,7 +242,7 @@ func monErrorLevel(res http.ResponseWriter, req *http.Request, vars map[string]s
 // Zabbix integration (with cfg curried)
 func zabbixDiscovery() func(http.ResponseWriter, *http.Request, map[string]string) {
 	return func(res http.ResponseWriter, req *http.Request, vars map[string]string) {
-		res.Write(ZabbixDiscoveryWeb(vars))
+		res.Write(zabbix.ZabbixDiscoveryWeb(vars, cfg))
 	}
 }
 
@@ -250,7 +266,7 @@ func HandleHTTP(f func(http.ResponseWriter, *http.Request, map[string]string)) f
 	var user string
 
 	handler := func(resp http.ResponseWriter, req *http.Request) {
-		resp.Header().Set("Server", SURFER)
+		resp.Header().Set("Server", "hls-monitor")
 		if cfg.User != "" && cfg.Pass != "" {
 			user = checkAuth(req)
 			if user != "" {
@@ -268,7 +284,7 @@ func HandleHTTP(f func(http.ResponseWriter, *http.Request, map[string]string)) f
 
 // Handler for unauthorized access.
 func requireAuth(w http.ResponseWriter, r *http.Request, v map[string]string) {
-	w.Header().Set("WWW-Authenticate", `Basic realm="`+SURFER+`"`)
+	w.Header().Set("WWW-Authenticate", `Basic realm="hls-monitor"`)
 	w.WriteHeader(401)
 	w.Write([]byte("401 Unauthorized\n"))
 }
@@ -310,11 +326,11 @@ func checkAuth(r *http.Request) string {
 			return ""
 		}
 	} else {
-		e := NewMD5Entry(passwd)
+		e := helpers.NewMD5Entry(passwd)
 		if e == nil {
 			return ""
 		}
-		if passwd != string(MD5Crypt([]byte(pair[1]), e.Salt, e.Magic)) {
+		if passwd != string(helpers.MD5Crypt([]byte(pair[1]), e.Salt, e.Magic)) {
 			return ""
 		}
 	}

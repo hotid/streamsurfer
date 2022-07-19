@@ -1,10 +1,13 @@
-// Stream parsers and keepers.
-package main
+package monitor
 
 import (
 	"expvar"
 	"fmt"
 	"github.com/grafov/bcast"
+	"github.com/hotid/streamsurfer/internal/pkg/helpers"
+	. "github.com/hotid/streamsurfer/internal/pkg/logging"
+	. "github.com/hotid/streamsurfer/internal/pkg/stats"
+	. "github.com/hotid/streamsurfer/internal/pkg/structures"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -12,7 +15,7 @@ import (
 )
 
 // Run monitors for each stream.
-func StreamMonitor() {
+func StreamMonitor(cfg *Config) {
 	var debugvars = expvar.NewMap("streams")
 	var requestedTasks = expvar.NewInt("requested-tasks")
 	var queueSizeHLSTasks = expvar.NewInt("hls-tasks-queue")
@@ -45,55 +48,54 @@ func StreamMonitor() {
 	debugvars.Set("wv-tasks-expired", expiredWVTasks)
 
 	ctl := bcast.NewGroup()
-	go ctl.Broadcasting(0)
-	go Heartbeat(ctl)
+	go Heartbeat(ctl, cfg)
 
 	// запуск проберов и потоков
-	for gname, gdata := range cfg.GroupParams {
-		switch gdata.Type {
+	for groupName, groupData := range cfg.GroupParams {
+		switch groupData.Type {
 		case HLS:
 			gtasks := make(chan *Task)
-			for i := 0; i < gdata.Probers; i++ {
-				go CupertinoProber(ctl, gtasks, debugvars)
+			for i := 0; i < groupData.Probers; i++ {
+				go CupertinoProber(ctl, gtasks, debugvars, cfg)
 				hlsprobecount++
 			}
 			gchunktasks := make(chan *Task)
-			for i := 0; i < gdata.MediaProbers; i++ {
+			for i := 0; i < groupData.MediaProbers; i++ {
 				go MediaProber(ctl, HLS, gchunktasks, debugvars)
 			}
-			for _, stream := range *cfg.GroupStreams[gname] {
-				go StreamBox(ctl, stream, HLS, gtasks, debugvars)
+			for _, stream := range cfg.GroupStreams[groupName] {
+				go StreamBox(ctl, stream, HLS, gtasks, debugvars, cfg)
 				hlscount++
 			}
 		case HDS:
 			gtasks := make(chan *Task)
-			for i := 0; i < gdata.Probers; i++ {
-				go SanjoseProber(ctl, gtasks, debugvars)
+			for i := 0; i < groupData.Probers; i++ {
+				go SanjoseProber(ctl, gtasks, debugvars, cfg)
 			}
 			gchunktasks := make(chan *Task)
-			for i := 0; i < gdata.MediaProbers; i++ {
+			for i := 0; i < groupData.MediaProbers; i++ {
 				go MediaProber(ctl, HDS, gchunktasks, debugvars)
 			}
-			for _, stream := range *cfg.GroupStreams[gname] {
-				go StreamBox(ctl, stream, HDS, gtasks, debugvars)
+			for _, stream := range cfg.GroupStreams[groupName] {
+				go StreamBox(ctl, stream, HDS, gtasks, debugvars, cfg)
 				hdscount++
 			}
 		case HTTP:
 			gtasks := make(chan *Task)
-			for i := 0; i < gdata.Probers; i++ {
-				go SimpleProber(ctl, gtasks, debugvars)
+			for i := 0; i < groupData.Probers; i++ {
+				go SimpleProber(ctl, gtasks, debugvars, cfg)
 			}
-			for _, stream := range *cfg.GroupStreams[gname] {
-				go StreamBox(ctl, stream, HTTP, gtasks, debugvars)
+			for _, stream := range cfg.GroupStreams[groupName] {
+				go StreamBox(ctl, stream, HTTP, gtasks, debugvars, cfg)
 				httpcount++
 			}
 		case WV:
 			gtasks := make(chan *Task)
-			for i := 0; i < gdata.Probers; i++ {
-				go WidevineProber(ctl, gtasks, debugvars)
+			for i := 0; i < groupData.Probers; i++ {
+				go WidevineProber(ctl, gtasks, debugvars, cfg)
 			}
-			for _, stream := range *cfg.GroupStreams[gname] {
-				go StreamBox(ctl, stream, WV, gtasks, debugvars)
+			for _, stream := range cfg.GroupStreams[groupName] {
+				go StreamBox(ctl, stream, WV, gtasks, debugvars, cfg)
 				wvcount++
 			}
 		}
@@ -143,7 +145,7 @@ func StreamMonitor() {
 	} else {
 		println("No Widevine monitors started.")
 	}
-
+	go ctl.Broadcast(0)
 	StatsGlobals.TotalMonitoringPoints = hlscount + hdscount + httpcount + wvcount
 }
 
@@ -152,7 +154,7 @@ func GroupBox(ctl *bcast.Group, group string, streamType StreamType, taskq chan 
 }
 
 // Container keep single stream properties and regulary make tasks for appropriate probers.
-func StreamBox(ctl *bcast.Group, stream Stream, streamType StreamType, taskq chan *Task, debugvars *expvar.Map) {
+func StreamBox(ctl *bcast.Group, stream Stream, streamType StreamType, taskq chan *Task, debugvars *expvar.Map, cfg *Config) {
 	var checkCount uint64 // число прошедших проверок
 	var addSleepToBrokenStream time.Duration
 	var tid int64 = time.Now().Unix() // got increasing offset on each program start
@@ -185,7 +187,7 @@ func StreamBox(ctl *bcast.Group, stream Stream, streamType StreamType, taskq cha
 
 	for {
 		select {
-		case recv := <-ctlrcv.In:
+		case recv := <-ctlrcv.Read:
 			command = recv.(Command)
 			switch command {
 			case START_MON:
@@ -258,7 +260,7 @@ func StreamBox(ctl *bcast.Group, stream Stream, streamType StreamType, taskq cha
 
 // Check & report internet availability. Stop all probers when sample internet resources not available.
 // Refs to config option ``samples``.
-func Heartbeat(ctl *bcast.Group) {
+func Heartbeat(ctl *bcast.Group, cfg *Config) {
 	var previous bool
 
 	ctlsnr := ctl.Join()
@@ -267,7 +269,7 @@ func Heartbeat(ctl *bcast.Group) {
 
 	for {
 		for _, uri := range cfg.Samples {
-			client := NewTimeoutClient(12*time.Second, 6*time.Second)
+			client := helpers.NewTimeoutClient(12*time.Second, 6*time.Second)
 			req, err := http.NewRequest("HEAD", uri, nil)
 			if err != nil {
 				fmt.Println("Internet not available. All checks stopped.")
@@ -304,7 +306,7 @@ func TaskExpired(task *Task) *Result {
 }
 
 // Helper. Execute stream check task and return result with check status.
-func ExecHTTP(task *Task) *Result {
+func ExecHTTP(task *Task, cfg *Config) *Result {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("trace dumped in ExecHTTP:", r)
@@ -319,7 +321,7 @@ func ExecHTTP(task *Task) *Result {
 		result.ContentLength = -1
 		return result
 	}
-	client := NewTimeoutClient(cfg.Params(task.Group).ConnectTimeout*time.Second, cfg.Params(task.Group).RWTimeout*time.Second)
+	client := helpers.NewTimeoutClient(cfg.Params(task.Group).ConnectTimeout*time.Second, cfg.Params(task.Group).RWTimeout*time.Second)
 	req, err := http.NewRequest("GET", task.URI, nil) // TODO разделить метод по проберам cfg.Params(task.Group).MethodHTTP
 	if err != nil {
 		fmt.Println(err)
@@ -329,7 +331,7 @@ func ExecHTTP(task *Task) *Result {
 		result.ContentLength = -1
 		return result
 	}
-	req.Header.Set("User-Agent", UserAgent())
+	req.Header.Set("User-Agent", helpers.UserAgent(cfg))
 	resp, err := client.Do(req)
 	result.Elapsed = time.Since(result.Started)
 	if err != nil {

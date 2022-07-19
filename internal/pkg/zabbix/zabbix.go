@@ -1,9 +1,11 @@
 // Integration with Zabbix monitoring tool
-package main
+package zabbix
 
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/hotid/streamsurfer/internal/pkg/helpers"
+	. "github.com/hotid/streamsurfer/internal/pkg/structures"
 	"sort"
 	"text/template"
 )
@@ -18,7 +20,7 @@ type streamTemplateData struct {
 	Check string
 }
 
-func ZabbixDiscoveryWeb(vars map[string]string) []byte {
+func ZabbixDiscoveryWeb(vars map[string]string, cfg *Config) []byte {
 	var page []byte
 	var tmplName, tmplTitle *template.Template
 	var bufn *bytes.Buffer = new(bytes.Buffer)
@@ -44,11 +46,11 @@ func ZabbixDiscoveryWeb(vars map[string]string) []byte {
 	}
 
 	for _, streams := range cfg.GroupStreams {
-		for _, stream := range *streams {
+		for _, stream := range streams {
 			bufn.Reset()
 			buft.Reset()
-			_ = tmplName.Execute(bufn, streamTemplateData{Stream: stream, Check: StreamType2String(stream.Type)})
-			_ = tmplTitle.Execute(buft, streamTemplateData{Stream: stream, Check: StreamType2String(stream.Type)})
+			_ = tmplName.Execute(bufn, streamTemplateData{Stream: stream, Check: helpers.StreamType2String(stream.Type)})
+			_ = tmplTitle.Execute(buft, streamTemplateData{Stream: stream, Check: helpers.StreamType2String(stream.Type)})
 			if _, exists := vars["group"]; exists { // report for selected group
 				if stream.Group == vars["group"] {
 					data.Data = append(data.Data, map[string]string{"{#STREAM}": bufn.String(), "{#TITLE}": buft.String()})
